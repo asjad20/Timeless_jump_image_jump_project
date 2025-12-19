@@ -10,6 +10,7 @@ from PIL import Image
 from dotenv import load_dotenv
 import logging
 import random
+import shutil
 
 load_dotenv()
 
@@ -218,17 +219,31 @@ def generate_image(user_prompt, image_paths, variation_number=None, base_seed=42
     # CRITICAL: Generate refined prompt with controlled variation
     refined_prompt = refine_prompt(user_prompt, variation_number=variation_number)
     
-    # Load reference images
-    images = []
-    for path in image_paths:
+    # FIX: Create temporary copies of images for this thread to avoid file conflicts
+    temp_images = []
+    thread_id = uuid.uuid4().hex[:8]
+    
+    for idx, path in enumerate(image_paths):
         try:
-            img = Image.open(path)
-            images.append(img)
+            # Create a temporary copy with unique name
+            temp_path = f"temp_{thread_id}_{idx}_{os.path.basename(path)}"
+            shutil.copy2(path, temp_path)
+            
+            # Load from the temporary copy
+            img = Image.open(temp_path)
+            temp_images.append(img)
+            
+            # Clean up the temporary file immediately after loading
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+                
         except Exception as e:
             logger.error(f"Failed to load image {path}: {e}")
             pass
     
-    if not images:
+    if not temp_images:
         logger.error("No images could be loaded")
         return None
     
@@ -236,7 +251,7 @@ def generate_image(user_prompt, image_paths, variation_number=None, base_seed=42
         client = genai.Client(api_key=GEMINI_API_KEY)
         
         # IMPORTANT: Reference images MUST be included in generation contents
-        contents = [refined_prompt] + images
+        contents = [refined_prompt] + temp_images
         
         # Calculate deterministic seed for this variation
         if variation_number is not None:
@@ -254,8 +269,6 @@ def generate_image(user_prompt, image_paths, variation_number=None, base_seed=42
             config=types.GenerateContentConfig(
                 response_modalities=['TEXT', 'IMAGE'],
                 temperature=1.0,  # Keep at 1.0 (Google's recommendation for Gemini 3)
-                # Note: Gemini API may not expose seed parameter directly
-                # but thinking_level helps with consistency
                 image_config=types.ImageConfig(
                     aspect_ratio=aspect_ratio,
                     image_size=resolution
@@ -462,7 +475,7 @@ if 'base_seed' not in st.session_state:
 if 'chat_session' not in st.session_state:
     st.session_state.chat_session = None
 
-if 'client' not in st.session_state:  # ADD THIS
+if 'client' not in st.session_state:
     st.session_state.client = None
 
 if 'current_image' not in st.session_state:
@@ -470,6 +483,9 @@ if 'current_image' not in st.session_state:
 
 if 'edit_history' not in st.session_state:
     st.session_state.edit_history = []
+
+if 'show_edit_field' not in st.session_state:
+    st.session_state.show_edit_field = False
 
 st.title("🎯 Product Image Generator")
 st.caption("Transform your product with AI")
@@ -532,10 +548,11 @@ with col1:
                 logger.info(f"🖼️ Reference images: {len(image_paths)}")
                 logger.info(f"📐 Resolution: {resolution}, Aspect: {aspect_ratio}")
                 
-                result_path,updated_client, new_chat = generate_image_with_chat(
+                result_path, updated_client, new_chat = generate_image_with_chat(
                     prompt, 
                     image_paths,
-                    chat_session=st.session_state.client,  # Start fresh
+                    client=None,
+                    chat_session=None,  # Start fresh
                     resolution=resolution,
                     aspect_ratio=aspect_ratio
                 )
@@ -546,6 +563,7 @@ with col1:
                     st.session_state.chat_session = new_chat
                     st.session_state.edit_history = [prompt]
                     st.session_state.client = updated_client
+                    st.session_state.show_edit_field = False
                     logger.info("✅ GENERATION SUCCESSFUL")
                     logger.info(f"💾 Image saved to: {result_path}")
                     logger.info(f"🔗 Chat session initialized for multi-turn editing")
@@ -560,64 +578,70 @@ with col1:
             st.warning("⚠️ Please enter a description.")
             logger.warning("⚠️ User attempted generation without prompt")
     
-    # Edit button (only show if we have a current image)
-    if st.session_state.current_image and st.session_state.chat_session:
-        if st.button("✏️ Edit Current Image", type="secondary", use_container_width=True):
-            if prompt:
-                with st.spinner("Editing image..."):
-                    logger.info("="*60)
-                    logger.info("✏️ MULTI-TURN EDIT STARTED")
-                    logger.info(f"📝 Edit instruction: {prompt}")
-                    logger.info(f"🔄 Edit number: {len(st.session_state.edit_history) + 1}")
-                    logger.info(f"📜 Previous edits: {st.session_state.edit_history}")
-                    
-                    result_path,updated_client, updated_chat = generate_image_with_chat(
-                        prompt,
-                        image_paths=None,  # Not needed for edits
-                        client=st.session_state.client,
-                        chat_session=st.session_state.chat_session,
-                        resolution=resolution,
-                        aspect_ratio=aspect_ratio
-                    )
-                    
-                    if result_path:
-                        st.session_state.generated_images = [result_path]
-                        st.session_state.current_image = result_path
-                        st.session_state.chat_session = updated_chat
-                        st.session_state.client = updated_client
-                        st.session_state.edit_history.append(prompt)
-                        logger.info("✅ EDIT SUCCESSFUL")
-                        logger.info(f"💾 Edited image saved to: {result_path}")
-                        logger.info(f"📊 Total edits in session: {len(st.session_state.edit_history)}")
-                        logger.info("="*60)
-                        st.success("✅ Image edited!")
-                        st.rerun()
-                    else:
-                        logger.error("❌ EDIT FAILED")
-                        logger.info("="*60)
-                        st.error("❌ Failed to edit image.")
-            else:
-                st.warning("⚠️ Please enter edit instructions.")
-                logger.warning("⚠️ User attempted edit without prompt")
-        
-        # Reset button
-        if st.button("🔄 Start New Image", type="secondary", use_container_width=True):
-            logger.info("="*60)
-            logger.info("🔄 RESET TRIGGERED - Starting fresh session")
-            logger.info(f"📜 Previous session had {len(st.session_state.edit_history)} edits")
-            st.session_state.chat_session = None
-            st.session_state.client = None
-            st.session_state.current_image = None
-            st.session_state.edit_history = []
-            st.session_state.generated_images = []
-            logger.info("✓ Session state cleared")
-            logger.info("="*60)
-            st.success("Ready for new image!")
-            st.rerun()
-    
-    # Display stored image
+    # Display stored single image with edit functionality
     if len(st.session_state.generated_images) == 1:
-        st.image(st.session_state.generated_images[0], caption="Generated Image")
+        # Create columns for thumbs down button and image
+        button_col, image_col = st.columns([0.1, 0.9])
+        
+        with button_col:
+            if st.button("👎", key="thumbs_down", help="Edit this image"):
+                st.session_state.show_edit_field = not st.session_state.show_edit_field
+                st.rerun()
+        
+        with image_col:
+            st.image(st.session_state.generated_images[0], caption="Generated Image")
+        
+        # Show edit field if thumbs down was clicked
+        if st.session_state.show_edit_field:
+            edit_prompt = st.text_input(
+                "What would you like to change?",
+                placeholder="Example: Make the handles silver",
+                key="edit_input"
+            )
+            
+            edit_col1, edit_col2 = st.columns([1, 1])
+            
+            with edit_col1:
+                if st.button("✏️ Apply Edit", type="primary", use_container_width=True):
+                    if edit_prompt:
+                        with st.spinner("Editing image..."):
+                            logger.info("="*60)
+                            logger.info("✏️ MULTI-TURN EDIT STARTED")
+                            logger.info(f"📝 Edit instruction: {edit_prompt}")
+                            logger.info(f"🔄 Edit number: {len(st.session_state.edit_history) + 1}")
+                            
+                            result_path, updated_client, updated_chat = generate_image_with_chat(
+                                edit_prompt,
+                                image_paths=None,
+                                client=st.session_state.client,
+                                chat_session=st.session_state.chat_session,
+                                resolution=resolution,
+                                aspect_ratio=aspect_ratio
+                            )
+                            
+                            if result_path:
+                                st.session_state.generated_images = [result_path]
+                                st.session_state.current_image = result_path
+                                st.session_state.chat_session = updated_chat
+                                st.session_state.client = updated_client
+                                st.session_state.edit_history.append(edit_prompt)
+                                st.session_state.show_edit_field = False
+                                logger.info("✅ EDIT SUCCESSFUL")
+                                logger.info(f"💾 Edited image saved to: {result_path}")
+                                logger.info("="*60)
+                                st.success("✅ Image edited!")
+                                st.rerun()
+                            else:
+                                logger.error("❌ EDIT FAILED")
+                                logger.info("="*60)
+                                st.error("❌ Failed to edit image.")
+                    else:
+                        st.warning("⚠️ Please enter edit instructions.")
+            
+            with edit_col2:
+                if st.button("❌ Cancel", use_container_width=True):
+                    st.session_state.show_edit_field = False
+                    st.rerun()
         
         # Show edit history if exists
         if st.session_state.edit_history and len(st.session_state.edit_history) > 0:
@@ -654,6 +678,12 @@ with col2:
                 
                 if result_paths:
                     st.session_state.generated_images = result_paths
+                    # Reset single image session when generating variations
+                    st.session_state.chat_session = None
+                    st.session_state.client = None
+                    st.session_state.current_image = None
+                    st.session_state.edit_history = []
+                    st.session_state.show_edit_field = False
                     logger.info(f"✅ GENERATED {len(result_paths)}/3 VARIATIONS")
                     logger.info("="*60)
                     st.success(f"✅ Generated {len(result_paths)} images!")
