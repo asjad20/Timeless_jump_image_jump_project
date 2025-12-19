@@ -245,7 +245,7 @@ def generate_image(user_prompt, image_paths, variation_number=None, base_seed=42
             generation_seed = base_seed
         
         logger.info(f"Generating image (variation: {variation_number}, seed: {generation_seed})...")
-        logger.info(f"Refined prompt length: {refined_prompt}")
+        logger.info(f"Refined prompt length: {len(refined_prompt)} chars")
         
         # CRITICAL: Add consistency parameters
         response = client.models.generate_content(
@@ -256,7 +256,6 @@ def generate_image(user_prompt, image_paths, variation_number=None, base_seed=42
                 temperature=1.0,  # Keep at 1.0 (Google's recommendation for Gemini 3)
                 # Note: Gemini API may not expose seed parameter directly
                 # but thinking_level helps with consistency
-                  # Use high reasoning for better accuracy
                 image_config=types.ImageConfig(
                     aspect_ratio=aspect_ratio,
                     image_size=resolution
@@ -283,6 +282,111 @@ def generate_image(user_prompt, image_paths, variation_number=None, base_seed=42
         return None
 
 
+def generate_image_with_chat(user_prompt, image_paths, client=None, chat_session=None, resolution="1K", aspect_ratio="16:9"):
+    """
+    Generate/edit image using Gemini 3 Pro Image with multi-turn chat support.
+    This maintains context across edits using thought signatures (handled automatically by SDK).
+    
+    Args:
+        user_prompt: User's description of desired changes
+        image_paths: List of paths to reference images (only used on first turn)
+        client: Shared genai.Client instance (MUST be provided for multi-turn)
+        chat_session: Existing chat session (None for first turn)
+        resolution: Image resolution (1K, 2K, 4K)
+        aspect_ratio: Aspect ratio (16:9, 1:1, etc.)
+    
+    Returns:
+        tuple: (output_path, client, chat_session) - path to saved image, client, and chat session for next turn
+    """
+    
+    if not user_prompt or not user_prompt.strip():
+        logger.error("Empty user prompt provided")
+        return None, client, None
+    
+    try:
+        # Create client ONCE if not provided
+        if client is None:
+            logger.info("🔧 Creating new persistent client")
+            client = genai.Client(api_key=GEMINI_API_KEY)
+        
+        # Create new chat session if this is the first turn
+        if chat_session is None:
+            logger.info("🆕 Initializing new multi-turn chat session")
+            
+            if not image_paths or len(image_paths) == 0:
+                logger.error("No image paths provided for initial generation")
+                return None, client, None
+            
+            if len(image_paths) > 10:
+                image_paths = image_paths[:10]
+                logger.info(f"Limiting to first 10 reference images")
+            
+            # Create chat with config - using the PERSISTENT client
+            chat_session = client.chats.create(
+                model="gemini-3-pro-image-preview",
+                config=types.GenerateContentConfig(
+                    response_modalities=['TEXT', 'IMAGE'],
+                    temperature=1.0,
+                    image_config=types.ImageConfig(
+                        aspect_ratio=aspect_ratio,
+                        image_size=resolution
+                    )
+                )
+            )
+            logger.info("✓ Chat session created successfully")
+            
+            # First turn: include reference images with refined prompt
+            refined_prompt = refine_prompt(user_prompt, variation_number=None)
+            logger.info(f"📝 Refined prompt (first turn): {len(refined_prompt)} chars")
+            
+            # Load reference images
+            images = []
+            for path in image_paths:
+                try:
+                    img = Image.open(path)
+                    images.append(img)
+                    logger.info(f"✓ Loaded reference: {os.path.basename(path)}")
+                except Exception as e:
+                    logger.error(f"✗ Failed to load {path}: {e}")
+            
+            if not images:
+                logger.error("No images could be loaded")
+                return None, client, None
+            
+            # Send message with prompt + images
+            message_content = [refined_prompt] + images
+            logger.info(f"📤 Sending first turn (1 prompt + {len(images)} images)")
+            
+        else:
+            # Subsequent turns: just send the edit instruction
+            # The chat context (including previous images) is maintained via thought signatures
+            logger.info("🔄 Continuing existing chat session (multi-turn edit)")
+            message_content = user_prompt
+            logger.info(f"📤 Sending edit instruction: {user_prompt[:100]}...")
+        
+        # Send message and get response
+        response = chat_session.send_message(message_content)
+        logger.info("✓ Response received from model")
+        
+        # Save the generated image
+        output_path = f"generated_jump_rope_{uuid.uuid4().hex[:8]}.png"
+        
+        for part in response.parts:
+            if part.inline_data is not None:
+                image = part.as_image()
+                image.save(output_path)
+                logger.info(f"💾 Saved image: {output_path}")
+                return output_path, client, chat_session  # RETURN 3 VALUES
+        
+        logger.error("❌ No image data in response")
+        return None, client, chat_session  # RETURN 3 VALUES
+    
+    except Exception as e:
+        logger.error(f"❌ Error in chat generation: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return None, client, None  # RETURN 3 VALUES
+    
 def generate_multiple_images(user_prompt, image_paths, count=3, base_seed=42, resolution="1K", aspect_ratio="16:9"):
     """
     Generates multiple images with CONTROLLED variation.
@@ -348,11 +452,24 @@ def get_images_from_folder(folder_path):
 # --- Streamlit UI ---
 st.set_page_config(page_title="Product Image Generator", layout="wide")
 
+# Initialize session state variables
 if 'generated_images' not in st.session_state:
     st.session_state.generated_images = []
 
 if 'base_seed' not in st.session_state:
     st.session_state.base_seed = 42
+
+if 'chat_session' not in st.session_state:
+    st.session_state.chat_session = None
+
+if 'client' not in st.session_state:  # ADD THIS
+    st.session_state.client = None
+
+if 'current_image' not in st.session_state:
+    st.session_state.current_image = None
+
+if 'edit_history' not in st.session_state:
+    st.session_state.edit_history = []
 
 st.title("🎯 Product Image Generator")
 st.caption("Transform your product with AI")
@@ -397,9 +514,11 @@ folder_path = "gemini_images"
 image_paths = get_images_from_folder(folder_path)
 
 if not image_paths:
+    st.warning("⚠️ No reference images found in 'gemini_images' folder.")
     logger.error("⚠️ No reference images found in 'gemini_images' folder.")
 else:
-    logger.error(f"✅ {len(image_paths)} reference images loaded")
+    st.info(f"✅ {len(image_paths)} reference images loaded")
+    logger.info(f"✅ {len(image_paths)} reference images loaded")
 
 col1, col2 = st.columns([1, 1])
 
@@ -407,26 +526,105 @@ with col1:
     if st.button("🎨 Generate Single Image", type="primary", use_container_width=True):
         if prompt and image_paths:
             with st.spinner("Generating image..."):
-                result_path = generate_image(
+                logger.info("="*60)
+                logger.info("🚀 SINGLE IMAGE GENERATION STARTED")
+                logger.info(f"📝 User prompt: {prompt}")
+                logger.info(f"🖼️ Reference images: {len(image_paths)}")
+                logger.info(f"📐 Resolution: {resolution}, Aspect: {aspect_ratio}")
+                
+                result_path,updated_client, new_chat = generate_image_with_chat(
                     prompt, 
                     image_paths,
-                    variation_number=None,
-                    base_seed=st.session_state.base_seed,
+                    chat_session=st.session_state.client,  # Start fresh
                     resolution=resolution,
                     aspect_ratio=aspect_ratio
                 )
                 
                 if result_path:
                     st.session_state.generated_images = [result_path]
+                    st.session_state.current_image = result_path
+                    st.session_state.chat_session = new_chat
+                    st.session_state.edit_history = [prompt]
+                    st.session_state.client = updated_client
+                    logger.info("✅ GENERATION SUCCESSFUL")
+                    logger.info(f"💾 Image saved to: {result_path}")
+                    logger.info(f"🔗 Chat session initialized for multi-turn editing")
+                    logger.info("="*60)
                     st.success("✅ Image generated!")
+                    st.rerun()
                 else:
+                    logger.error("❌ GENERATION FAILED")
+                    logger.info("="*60)
                     st.error("❌ Failed to generate image.")
         elif not prompt:
             st.warning("⚠️ Please enter a description.")
+            logger.warning("⚠️ User attempted generation without prompt")
+    
+    # Edit button (only show if we have a current image)
+    if st.session_state.current_image and st.session_state.chat_session:
+        if st.button("✏️ Edit Current Image", type="secondary", use_container_width=True):
+            if prompt:
+                with st.spinner("Editing image..."):
+                    logger.info("="*60)
+                    logger.info("✏️ MULTI-TURN EDIT STARTED")
+                    logger.info(f"📝 Edit instruction: {prompt}")
+                    logger.info(f"🔄 Edit number: {len(st.session_state.edit_history) + 1}")
+                    logger.info(f"📜 Previous edits: {st.session_state.edit_history}")
+                    
+                    result_path,updated_client, updated_chat = generate_image_with_chat(
+                        prompt,
+                        image_paths=None,  # Not needed for edits
+                        client=st.session_state.client,
+                        chat_session=st.session_state.chat_session,
+                        resolution=resolution,
+                        aspect_ratio=aspect_ratio
+                    )
+                    
+                    if result_path:
+                        st.session_state.generated_images = [result_path]
+                        st.session_state.current_image = result_path
+                        st.session_state.chat_session = updated_chat
+                        st.session_state.client = updated_client
+                        st.session_state.edit_history.append(prompt)
+                        logger.info("✅ EDIT SUCCESSFUL")
+                        logger.info(f"💾 Edited image saved to: {result_path}")
+                        logger.info(f"📊 Total edits in session: {len(st.session_state.edit_history)}")
+                        logger.info("="*60)
+                        st.success("✅ Image edited!")
+                        st.rerun()
+                    else:
+                        logger.error("❌ EDIT FAILED")
+                        logger.info("="*60)
+                        st.error("❌ Failed to edit image.")
+            else:
+                st.warning("⚠️ Please enter edit instructions.")
+                logger.warning("⚠️ User attempted edit without prompt")
+        
+        # Reset button
+        if st.button("🔄 Start New Image", type="secondary", use_container_width=True):
+            logger.info("="*60)
+            logger.info("🔄 RESET TRIGGERED - Starting fresh session")
+            logger.info(f"📜 Previous session had {len(st.session_state.edit_history)} edits")
+            st.session_state.chat_session = None
+            st.session_state.client = None
+            st.session_state.current_image = None
+            st.session_state.edit_history = []
+            st.session_state.generated_images = []
+            logger.info("✓ Session state cleared")
+            logger.info("="*60)
+            st.success("Ready for new image!")
+            st.rerun()
     
     # Display stored image
     if len(st.session_state.generated_images) == 1:
         st.image(st.session_state.generated_images[0], caption="Generated Image")
+        
+        # Show edit history if exists
+        if st.session_state.edit_history and len(st.session_state.edit_history) > 0:
+            with st.expander(f"📜 Edit History ({len(st.session_state.edit_history)} edits)"):
+                for idx, edit in enumerate(st.session_state.edit_history, 1):
+                    st.text(f"{idx}. {edit}")
+        
         with open(st.session_state.generated_images[0], "rb") as file:
             st.download_button(
                 label="📥 Download Image",
@@ -440,6 +638,11 @@ with col2:
     if st.button("🎨 Generate 3 Variations", type="primary", use_container_width=True):
         if prompt and image_paths:
             with st.spinner("Generating 3 variations..."):
+                logger.info("="*60)
+                logger.info("🎨 MULTI-VARIATION GENERATION STARTED")
+                logger.info(f"📝 User prompt: {prompt}")
+                logger.info(f"🔢 Variations: 3")
+                
                 result_paths = generate_multiple_images(
                     prompt, 
                     image_paths, 
@@ -451,11 +654,17 @@ with col2:
                 
                 if result_paths:
                     st.session_state.generated_images = result_paths
+                    logger.info(f"✅ GENERATED {len(result_paths)}/3 VARIATIONS")
+                    logger.info("="*60)
                     st.success(f"✅ Generated {len(result_paths)} images!")
+                    st.rerun()
                 else:
+                    logger.error("❌ VARIATION GENERATION FAILED")
+                    logger.info("="*60)
                     st.error("❌ Failed to generate images.")
         elif not prompt:
             st.warning("⚠️ Please enter a description.")
+            logger.warning("⚠️ User attempted variation generation without prompt")
     
     # Display stored images
     if len(st.session_state.generated_images) == 3:
